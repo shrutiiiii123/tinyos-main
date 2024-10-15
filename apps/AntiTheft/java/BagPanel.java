@@ -11,78 +11,184 @@
  */
 
 
-import javax.swing.*;
+ import javax.swing.*;
 import java.awt.*;
 import java.awt.event.*;
+import java.io.*;
+import net.tinyos.message.*;
+import net.tinyos.packet.*;
+import net.tinyos.util.*;
 
 /**
- * A GridBagLayout based panel with convenience methods for 
- * making various swing items. These methods also ensure a
- * consistent appearance.
- *
- * @author David Gay
+ * The AntiTheft GUI for managing settings and displaying alerts.
  */
-public class BagPanel extends JPanel {
-    Font boldFont = new Font("Dialog", Font.BOLD, 12);
-    Font normalFont = new Font("Dialog", Font.PLAIN, 12);
+public class AntiTheftGui implements MessageListener, Messenger {
+    MoteIF mote; // For talking to the antitheft root node
 
-    GridBagLayout bag;
-    GridBagConstraints c;
+    /* Various swing components we need to use after initialization */
+    JFrame frame; // The whole frame
+    JTextArea mssgArea; // The message area
+    JTextField fieldInterval; // The requested check interval
 
-    /* Create a panel with a bag layout. Create some constraints are
-       users can modify prior to creating widgets - the current constraints
-       will be applied to all widgets created with makeXXX */
-    public BagPanel() {
-	bag = new GridBagLayout();
-	setLayout(bag);
-	c = new GridBagConstraints();
+    /* The checkboxes for the requested settings */
+    JCheckBox detDarkCb, detAccelCb, repLedCb, repSirenCb, repServerCb,
+    repNeighboursCb;
+
+    public AntiTheftGui() {
+        try {
+            guiInit();
+            /* Setup communication with the mote and request a messageReceived
+               callback when an AlertMsg is received */
+            mote = new MoteIF(this);
+            mote.registerListener(new AlertMsg(), this);
+        } catch(Exception e) {
+            e.printStackTrace();
+            System.exit(2);
+        }
     }
 
-    /* The makeXXX methods create XXX widgets, apply the current constraints
-       to them, and add them to this panel. The widget is returned in case
-       the creator needs to hang on to it. */
+    /* Build up the GUI using Swing magic. */
+    private void guiInit() throws Exception {
+        JPanel mainPanel = new JPanel(new BorderLayout());
+        mainPanel.setMinimumSize(new Dimension(500, 250));
+        mainPanel.setPreferredSize(new Dimension(500, 300));
 
-    public JButton makeButton(String label, ActionListener action) {
-	JButton button = new JButton();
-        button.setText(label);
-        button.setFont(boldFont);
-	button.addActionListener(action);
-	bag.setConstraints(button, c);
-	add(button);
-	return button;
+        /* The message area */
+        JScrollPane mssgPanel = new JScrollPane();
+        mssgPanel.setVerticalScrollBarPolicy(JScrollPane.VERTICAL_SCROLLBAR_ALWAYS);
+        mssgPanel.setAutoscrolls(true);
+        mssgArea = new JTextArea();
+        mssgArea.setFont(new java.awt.Font("Monospaced", Font.PLAIN, 20));
+        mainPanel.add(mssgPanel, BorderLayout.CENTER);
+        mssgPanel.getViewport().add(mssgArea, null);
+        
+        /* The button area */
+        BagPanel buttonPanel = new BagPanel();
+        GridBagConstraints c = buttonPanel.c;
+
+        c.fill = GridBagConstraints.HORIZONTAL;
+        c.gridwidth = GridBagConstraints.REMAINDER;
+
+        buttonPanel.makeLabel("Detection", JLabel.CENTER);
+        c.gridwidth = GridBagConstraints.RELATIVE;
+        detDarkCb = buttonPanel.makeCheckBox("Dark", true);
+        c.gridwidth = GridBagConstraints.REMAINDER;
+        detAccelCb = buttonPanel.makeCheckBox("Movement", false);
+        buttonPanel.makeSeparator(SwingConstants.HORIZONTAL);
+
+        buttonPanel.makeLabel("Theft Reports", JLabel.CENTER);
+        c.gridwidth = GridBagConstraints.RELATIVE;
+        repLedCb = buttonPanel.makeCheckBox("LED", true);
+        c.gridwidth = GridBagConstraints.REMAINDER;
+        repSirenCb = buttonPanel.makeCheckBox("Siren", false);
+        c.gridwidth = GridBagConstraints.RELATIVE;
+        repServerCb = buttonPanel.makeCheckBox("Server", false);
+        c.gridwidth = GridBagConstraints.REMAINDER;
+        repNeighboursCb = buttonPanel.makeCheckBox("Neighbours", false);
+        buttonPanel.makeSeparator(SwingConstants.HORIZONTAL);
+
+        buttonPanel.makeLabel("Interval", JLabel.CENTER);
+        fieldInterval = buttonPanel.makeTextField(10, null);
+        fieldInterval.setText(Integer.toString(Constants.DEFAULT_CHECK_INTERVAL));
+
+        ActionListener settingsAction = new ActionListener() {
+            public void actionPerformed(ActionEvent e) {
+                updateSettings();
+            }
+        };
+        buttonPanel.makeButton("Update", settingsAction);
+
+        mainPanel.add(buttonPanel, BorderLayout.EAST);
+
+        /* The frame part */
+        frame = new JFrame("AntiTheft");
+        frame.setSize(mainPanel.getPreferredSize());
+        frame.getContentPane().add(mainPanel);
+        frame.setVisible(true);
+        frame.addWindowListener(new WindowAdapter() {
+            public void windowClosing(WindowEvent e) { System.exit(0); }
+        });
     }
 
-    public JCheckBox makeCheckBox(String label, boolean selected) {
-	JCheckBox box = new JCheckBox(label, selected);
-	box.setFont(normalFont);
-	bag.setConstraints(box, c);
-	add(box);
-	return box;
+    /* Add a message to the message area, auto-scroll to end */
+    public synchronized void message(String s) {
+        mssgArea.append(s + "\n");
+        mssgArea.setCaretPosition(mssgArea.getDocument().getLength());
     }
 
-    public JLabel makeLabel(String txt, int alignment) {
-	JLabel label = new JLabel(txt, alignment);
-	label.setFont(boldFont);
-	bag.setConstraints(label, c);
-	add(label);
-	return label;
+    /* Popup an error message */
+    void error(String msg) {
+        JOptionPane.showMessageDialog(frame, msg, "Error",
+                JOptionPane.ERROR_MESSAGE);
     }
 
-    public JTextField makeTextField(int columns, ActionListener action) {
-	JTextField tf = new JTextField(columns);
-	tf.setFont(normalFont);
-	tf.setMaximumSize(tf.getPreferredSize());
-	tf.addActionListener(action);
-	bag.setConstraints(tf, c);
-	add(tf);
-	return tf;
+    /* User pressed the "Update" button. Read the GUI fields and
+       send a SettingsMsg with the requested values. */
+    public void updateSettings() { 
+        SettingsMsg smsg = new SettingsMsg();
+        short alert = 0;
+        short detect = 0;
+        int checkInterval = Constants.DEFAULT_CHECK_INTERVAL;
+
+        /* Extract current interval value, fixing bad values */
+        String intervalS = fieldInterval.getText().trim();
+        try {
+            int newInterval = Integer.parseInt(intervalS);
+            if (newInterval < 10) throw new NumberFormatException();
+            checkInterval = newInterval;
+        } catch (NumberFormatException e) { 
+            /* Reset field when value is bad */
+            fieldInterval.setText("" + checkInterval);
+        }
+
+        /* Extract alert settings */
+        if (repLedCb.isSelected())
+            alert |= Constants.ALERT_LEDS;
+        if (repSirenCb.isSelected())
+            alert |= Constants.ALERT_SOUND;
+        if (repNeighboursCb.isSelected())
+            alert |= Constants.ALERT_RADIO;
+        if (repServerCb.isSelected())
+            alert |= Constants.ALERT_ROOT;
+        if (alert == 0) {
+            /* If nothing select, force-select LEDs */
+            alert = Constants.ALERT_LEDS;
+            repLedCb.setSelected(true);
+        }
+
+        /* Extract detection settings */
+        if (detDarkCb.isSelected())
+            detect |= Constants.DETECT_DARK;
+        if (detAccelCb.isSelected())
+            detect |= Constants.DETECT_ACCEL;
+        if (detect == 0) {
+            /* If no detection selected, force-select dark */
+            detect = Constants.DETECT_DARK;
+            detDarkCb.setSelected(true);
+        }
+
+        /* Build and send settings message */
+        smsg.set_alert(alert);
+        smsg.set_detect(detect);
+        smsg.set_checkInterval(checkInterval);
+        try {
+            mote.send(MoteIF.TOS_BCAST_ADDR, smsg);
+        } catch (IOException e) {
+            error("Cannot send message to mote");
+        }
     }
 
-    public JSeparator makeSeparator(int axis) {
-	JSeparator sep = new JSeparator(axis);
-	bag.setConstraints(sep, c);
-	add(sep);
-	return sep;
+    /* Message received from mote network. Update message area if it's
+       a theft message. */
+    public void messageReceived(int dest_addr, Message msg) {
+        if (msg instanceof AlertMsg) {
+            AlertMsg alertMsg = (AlertMsg)msg;
+            message("Theft of " + alertMsg.get_stolenId());
+        }
     }
 
+    /* Just start the app... */
+    public static void main(String[] args) {
+        AntiTheftGui me = new AntiTheftGui();
+    }
 }
